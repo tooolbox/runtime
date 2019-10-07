@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"mime/multipart"
 	"net/http"
@@ -102,105 +101,35 @@ func (r *request) buildHTTP(mediaType, basePath string, producers map[string]run
 	//	}
 	//}
 
-	// create http request
-	var reinstateSlash bool
-	if r.pathPattern != "" && r.pathPattern != "/" && r.pathPattern[len(r.pathPattern)-1] == '/' {
-		reinstateSlash = true
-	}
-	urlPath := path.Join(basePath, r.pathPattern)
-	for k, v := range r.pathParams {
-		urlPath = strings.Replace(urlPath, "{"+k+"}", url.PathEscape(v), -1)
-	}
-	if reinstateSlash {
-		urlPath = urlPath + "/"
-	}
-
-	var body io.ReadCloser
+	// Using an io.Reader instead of an io.ReadCloser.
+	// When we create the http.Request it will set
+	// the content length automatically if the underlying
+	// implementation is a bytes.Buffer, and wrap it in
+	// a ReadCloser.
+	var body io.Reader
 	var pr *io.PipeReader
 	var pw *io.PipeWriter
-	var extBody bool
 
 	r.buf = bytes.NewBuffer(nil)
 	if r.payload != nil || len(r.formFields) > 0 || len(r.fileFields) > 0 {
-		body = ioutil.NopCloser(r.buf)
+		body = r.buf
 		if r.isMultipart(mediaType) {
 			pr, pw = io.Pipe()
 			body = pr
-			extBody = true
 		}
 	}
-
-	if auth != nil {
-		defer func() {
-
-			if resultErr != nil {
-				return
-			}
-
-			defer func() {
-				r.getBody = getRequestBuffer
-			}()
-
-			var copyErr error
-			if extBody {
-				r.getBody = func(r *request) []byte {
-
-					if !extBody {
-						return getRequestBuffer(r)
-					}
-
-					if _, copyErr = io.Copy(r.buf, result.Body); copyErr != nil {
-						return nil
-					}
-
-					if copyErr = result.Body.Close(); copyErr != nil {
-						return nil
-					}
-
-					result.Body = ioutil.NopCloser(r.buf)
-					result.GetBody = func() (io.ReadCloser, error) {
-						return ioutil.NopCloser(r.buf), nil
-					}
-					extBody = false
-					return getRequestBuffer(r)
-				}
-			}
-
-			if err := auth.AuthenticateRequest(r, registry); err != nil {
-				result, resultErr = nil, err
-				return
-			}
-
-			if copyErr != nil {
-				result, resultErr = nil, fmt.Errorf("error retrieving the response body: %v", copyErr)
-				return
-			}
-
-		}()
-	}
-
-	req, err := http.NewRequest(r.method, urlPath, body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.URL.RawQuery = r.query.Encode()
-	req.Header = r.header
 
 	// check if this is a form type request
 	if len(r.formFields) > 0 || len(r.fileFields) > 0 {
 		if !r.isMultipart(mediaType) {
-			req.Header.Set(runtime.HeaderContentType, mediaType)
+			r.header.Set(runtime.HeaderContentType, mediaType)
 			formString := r.formFields.Encode()
-			// set content length before writing to the buffer
-			req.ContentLength = int64(len(formString))
-			// write the form values as the body
 			r.buf.WriteString(formString)
-			return req, nil
+			goto DoneChoosingBodySource
 		}
 
 		mp := multipart.NewWriter(pw)
-		req.Header.Set(runtime.HeaderContentType, mangleContentType(mediaType, mp.Boundary()))
+		r.header.Set(runtime.HeaderContentType, mangleContentType(mediaType, mp.Boundary()))
 
 		go func() {
 			defer func() {
@@ -238,8 +167,8 @@ func (r *request) buildHTTP(mediaType, basePath string, producers map[string]run
 			}
 
 		}()
-		return req, nil
 
+		goto DoneChoosingBodySource
 	}
 
 	// if there is payload, use the producer to write the payload, and then
@@ -247,31 +176,34 @@ func (r *request) buildHTTP(mediaType, basePath string, producers map[string]run
 	if r.payload != nil {
 		// TODO: infer most appropriate content type based on the producer used,
 		// and the `consumers` section of the spec/operation
-		req.Header.Set(runtime.HeaderContentType, mediaType)
+		r.header.Set(runtime.HeaderContentType, mediaType)
 		if rdr, ok := r.payload.(io.ReadCloser); ok {
-			req.Body = rdr
-			extBody = true
-
-			return req, nil
+			body = rdr
+			goto DoneChoosingBodySource
 		}
 
 		if rdr, ok := r.payload.(io.Reader); ok {
-			req.Body = ioutil.NopCloser(rdr)
-			extBody = true
-
-			return req, nil
+			body = rdr
+			goto DoneChoosingBodySource
 		}
 
-		req.GetBody = func() (io.ReadCloser, error) {
-			var b bytes.Buffer
-			producer := producers[mediaType]
-			if err := producer.Produce(&b, r.payload); err != nil {
-				return nil, err
-			}
+		// When we make the http.Request it will automatically set
+		// its GetBody field if the underlying implementation is
+		// a bytes.Buffer.
+		//
+		// req.GetBody = func() (io.ReadCloser, error) {
+		// 	var b bytes.Buffer
+		// 	producer := producers[mediaType]
+		// 	if err := producer.Produce(&b, r.payload); err != nil {
+		// 		return nil, err
+		// 	}
 
-			return ioutil.NopCloser(&b), nil
-		}
+		// 	return ioutil.NopCloser(&b), nil
+		// }
 
+		// When an http.Request is created with body set to a bytes.Buffer,
+		// it will automatically set the content length.
+		//
 		// set the content length of the request or else a chunked transfer is
 		// declared, and this corrupts outgoing JSON payloads. the content's
 		// length must be set prior to the body being written per the spec at
@@ -284,20 +216,89 @@ func (r *request) buildHTTP(mediaType, basePath string, producers map[string]run
 		//
 		// to that end a temporary buffer, b, is created to produce the payload
 		// body, and then its size is used to set the request's content length
-		var b bytes.Buffer
 		producer := producers[mediaType]
-		if err := producer.Produce(&b, r.payload); err != nil {
-			return nil, err
-		}
-		req.ContentLength = int64(b.Len())
-		if _, err := r.buf.Write(b.Bytes()); err != nil {
+		if err := producer.Produce(r.buf, r.payload); err != nil {
 			return nil, err
 		}
 	}
 
-	if runtime.CanHaveBody(req.Method) && req.Body == nil && req.Header.Get(runtime.HeaderContentType) == "" {
-		req.Header.Set(runtime.HeaderContentType, mediaType)
+DoneChoosingBodySource:
+
+	if runtime.CanHaveBody(r.method) && body == nil && r.header.Get(runtime.HeaderContentType) == "" {
+		r.header.Set(runtime.HeaderContentType, mediaType)
 	}
+
+	if auth != nil {
+
+		var copyErr error
+
+		// If we're not using r.buf as our http.Request's body,
+		// either the payload is an io.Reader or io.ReadCloser,
+		// or we're doing a multipart form/file.
+		//
+		// In that case, if the AuthenticateRequest call asks for the body,
+		// we must read it into a buffer and provide that, then use that buffer
+		// as the body of our http.Request.
+		//
+		// If for some reason the copy fails, there's no way to return that
+		// error to the GetBody() call, so return it afterwards, as a priority
+		// over any error from the AuthenticateRequest call, because
+		// the mis-read body may have interfered with the auth.
+		if buf, ok := body.(*bytes.Buffer); !ok || buf != r.buf {
+
+			copied := false
+			r.getBody = func(r *request) []byte {
+
+				if copied {
+					return getRequestBuffer(r)
+				}
+
+				if _, copyErr = io.Copy(r.buf, body); copyErr != nil {
+					return nil
+				}
+
+				if copyErr = result.Body.Close(); copyErr != nil {
+					return nil
+				}
+
+				body = r.buf
+				copied = true
+				return getRequestBuffer(r)
+			}
+		}
+
+		authErr := auth.AuthenticateRequest(r, registry)
+
+		if copyErr != nil {
+			return nil, fmt.Errorf("error retrieving the response body: %v", copyErr)
+		}
+
+		if authErr != nil {
+			return nil, authErr
+		}
+
+	}
+
+	// create http request
+	var reinstateSlash bool
+	if r.pathPattern != "" && r.pathPattern != "/" && r.pathPattern[len(r.pathPattern)-1] == '/' {
+		reinstateSlash = true
+	}
+	urlPath := path.Join(basePath, r.pathPattern)
+	for k, v := range r.pathParams {
+		urlPath = strings.Replace(urlPath, "{"+k+"}", url.PathEscape(v), -1)
+	}
+	if reinstateSlash {
+		urlPath = urlPath + "/"
+	}
+
+	req, err := http.NewRequest(r.method, urlPath, body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.URL.RawQuery = r.query.Encode()
+	req.Header = r.header
 
 	return req, nil
 }
