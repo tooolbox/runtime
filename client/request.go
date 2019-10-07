@@ -42,6 +42,7 @@ func newRequest(method, pathPattern string, writer runtime.ClientRequestWriter) 
 		header:      make(http.Header),
 		query:       make(url.Values),
 		timeout:     DefaultTimeout,
+		getBody:     getRequestBuffer,
 	}, nil
 }
 
@@ -67,6 +68,8 @@ type request struct {
 	payload    interface{}
 	timeout    time.Duration
 	buf        *bytes.Buffer
+
+	getBody func(r *request) []byte
 }
 
 var (
@@ -87,17 +90,17 @@ func (r *request) BuildHTTP(mediaType, basePath string, producers map[string]run
 	return r.buildHTTP(mediaType, basePath, producers, registry, nil)
 }
 
-func (r *request) buildHTTP(mediaType, basePath string, producers map[string]runtime.Producer, registry strfmt.Registry, auth runtime.ClientAuthInfoWriter) (*http.Request, error) {
+func (r *request) buildHTTP(mediaType, basePath string, producers map[string]runtime.Producer, registry strfmt.Registry, auth runtime.ClientAuthInfoWriter) (result *http.Request, resultErr error) {
 	// build the data
 	if err := r.writer.WriteToRequest(r, registry); err != nil {
 		return nil, err
 	}
 
-	if auth != nil {
-		if err := auth.AuthenticateRequest(r, registry); err != nil {
-			return nil, err
-		}
-	}
+	//if auth != nil {
+	//	if err := auth.AuthenticateRequest(request, r.Formats); err != nil {
+	//		return nil, err
+	//	}
+	//}
 
 	// create http request
 	var reinstateSlash bool
@@ -115,6 +118,7 @@ func (r *request) buildHTTP(mediaType, basePath string, producers map[string]run
 	var body io.ReadCloser
 	var pr *io.PipeReader
 	var pw *io.PipeWriter
+	var extBody bool
 
 	r.buf = bytes.NewBuffer(nil)
 	if r.payload != nil || len(r.formFields) > 0 || len(r.fileFields) > 0 {
@@ -122,10 +126,60 @@ func (r *request) buildHTTP(mediaType, basePath string, producers map[string]run
 		if r.isMultipart(mediaType) {
 			pr, pw = io.Pipe()
 			body = pr
+			extBody = true
 		}
 	}
-	req, err := http.NewRequest(r.method, urlPath, body)
 
+	if auth != nil {
+		defer func() {
+
+			if resultErr != nil {
+				return
+			}
+
+			defer func() {
+				r.getBody = getRequestBuffer
+			}()
+
+			var copyErr error
+			if extBody {
+				r.getBody = func(r *request) []byte {
+
+					if !extBody {
+						return getRequestBuffer(r)
+					}
+
+					if _, copyErr = io.Copy(r.buf, result.Body); copyErr != nil {
+						return nil
+					}
+
+					if copyErr = result.Body.Close(); copyErr != nil {
+						return nil
+					}
+
+					result.Body = ioutil.NopCloser(r.buf)
+					result.GetBody = func() (io.ReadCloser, error) {
+						return ioutil.NopCloser(r.buf), nil
+					}
+					extBody = false
+					return getRequestBuffer(r)
+				}
+			}
+
+			if err := auth.AuthenticateRequest(r, registry); err != nil {
+				result, resultErr = nil, err
+				return
+			}
+
+			if copyErr != nil {
+				result, resultErr = nil, fmt.Errorf("error retrieving the response body: %v", copyErr)
+				return
+			}
+
+		}()
+	}
+
+	req, err := http.NewRequest(r.method, urlPath, body)
 	if err != nil {
 		return nil, err
 	}
@@ -196,12 +250,14 @@ func (r *request) buildHTTP(mediaType, basePath string, producers map[string]run
 		req.Header.Set(runtime.HeaderContentType, mediaType)
 		if rdr, ok := r.payload.(io.ReadCloser); ok {
 			req.Body = rdr
+			extBody = true
 
 			return req, nil
 		}
 
 		if rdr, ok := r.payload.(io.Reader); ok {
 			req.Body = ioutil.NopCloser(rdr)
+			extBody = true
 
 			return req, nil
 		}
@@ -266,6 +322,10 @@ func (r *request) GetPath() string {
 }
 
 func (r *request) GetBody() []byte {
+	return r.getBody(r)
+}
+
+func getRequestBuffer(r *request) []byte {
 	if r.buf == nil {
 		return nil
 	}
